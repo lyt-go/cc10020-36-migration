@@ -28,6 +28,20 @@ class BatchExecuteRequest(BaseModel):
 
 class DlqReplayRequest(BaseModel):
     dlq_ids: list[int]
+    deployment_version: str | None = None
+
+
+class DlqPayloadMigrateRequest(BaseModel):
+    batch_id: str | None = None
+    resume: bool = False
+    limit: int | None = None
+    interrupt_after: int | None = None
+    deployment_version: str | None = None
+
+
+class DlqPayloadRollbackRequest(BaseModel):
+    batch_id: str | None = None
+    deployment_version: str | None = None
 
 
 class BackfillExecuteRequest(BaseModel):
@@ -84,7 +98,9 @@ def pipeline_dlq_replay(request: DlqReplayRequest) -> dict[str, Any]:
     完整覆盖：dlq_handler → mq_consumer → call_trace_log。
     """
     from app.services.dlq_handler import DlqHandlerService
+    from app.services.dlq_payload import DEPLOYMENT_VERSION
     svc = DlqHandlerService()
+    deployment_version = request.deployment_version or DEPLOYMENT_VERSION
 
     if len(request.dlq_ids) == 1 and request.dlq_ids[0] == -1:
         # 全部待处置记录重放
@@ -94,9 +110,70 @@ def pipeline_dlq_replay(request: DlqReplayRequest) -> dict[str, Any]:
         from app.persistence import json_store
         all_dlq = json_store.get_all("dlq_handler")
         pending_ids = [int(r["id"]) for r in all_dlq if r.get("status") in ("草稿", "待处置")]
-        return svc.batch_replay(pending_ids)
+        return svc.batch_replay(
+            pending_ids,
+            deployment_version=deployment_version,
+        )
 
-    return svc.batch_replay(request.dlq_ids)
+    return svc.batch_replay(request.dlq_ids, deployment_version=deployment_version)
+
+
+@router.post("/dlq-payload/migrate")
+def pipeline_dlq_payload_migrate(request: DlqPayloadMigrateRequest) -> dict[str, Any]:
+    """死信载荷迁移：存量字符串载荷 → 版本化死信载荷。
+
+    支持按批次中断、按同一 batch_id 或 resume=true 续做；不改变死信编号
+    与原始队列。迁移完成后可用 /dlq-payload/{dlq_id} 核对解析结果。
+    """
+    from app.services.dlq_handler import DlqHandlerService
+    from app.services.dlq_payload import DEPLOYMENT_VERSION
+    svc = DlqHandlerService()
+    deployment_version = request.deployment_version or DEPLOYMENT_VERSION
+    if request.resume and not request.batch_id:
+        return svc.resume_payload_migration(
+            limit=request.limit,
+            interrupt_after=request.interrupt_after,
+            deployment_version=deployment_version,
+        )
+    return svc.migrate_legacy_payloads(
+        batch_id=request.batch_id,
+        resume=request.resume,
+        limit=request.limit,
+        interrupt_after=request.interrupt_after,
+        deployment_version=deployment_version,
+    )
+
+
+@router.post("/dlq-payload/rollback")
+def pipeline_dlq_payload_rollback(request: DlqPayloadRollbackRequest) -> dict[str, Any]:
+    """回滚迁移：移除迁移写入的副本，原文与处置凭证保持可用。"""
+    from app.services.dlq_handler import DlqHandlerService
+    from app.services.dlq_payload import DEPLOYMENT_VERSION
+    svc = DlqHandlerService()
+    return svc.rollback_payload_migration(
+        batch_id=request.batch_id,
+        deployment_version=request.deployment_version or DEPLOYMENT_VERSION,
+    )
+
+
+@router.get("/dlq-payload/migration-status")
+def pipeline_dlq_payload_migration_status(batch_id: str | None = None) -> dict[str, Any]:
+    """查询迁移批次状态与剩余量，用于中断后续做。"""
+    from app.services.dlq_handler import DlqHandlerService
+    return DlqHandlerService().migration_status(batch_id=batch_id)
+
+
+@router.get("/dlq-payload/{dlq_id}")
+def pipeline_dlq_payload_view(dlq_id: int, deployment_version: str | None = None) -> dict[str, Any]:
+    """核对某条死信实际会被消费入口取得的载荷（按声明版本解释）。"""
+    from app.services.dlq_handler import DlqHandlerService
+    from app.services.dlq_payload import DEPLOYMENT_VERSION
+    version = deployment_version or DEPLOYMENT_VERSION
+    svc = DlqHandlerService()
+    view = svc.get_payload_for_replay(dlq_id, deployment_version=version)
+    view["review_ledger"] = svc.list_review_ledger(dlq_id)
+    view["receipt"] = svc.get_receipt(dlq_id, deployment_version=version)
+    return view
 
 
 @router.post("/backfill-execute")

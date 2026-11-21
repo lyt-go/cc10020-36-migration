@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -151,19 +150,188 @@ class MqConsumerService(BaseModuleService):
         }
 
     def _route_to_dlq(self, consumer_id: int, message: dict[str, Any], reason: str) -> dict[str, Any]:
-        """将消费失败的消息路由到死信队列。"""
+        """将消费失败的消息路由到死信队列。
+
+        消息体以结构化载荷 + 显式版本入队，原文（JSON 文本）同时保留，
+        供旧消费者按原样定位消息。
+        """
         try:
             from app.services.dlq_handler import DlqHandlerService
             dlq_svc = DlqHandlerService()
-            payload_str = json.dumps(message.get("payload", {}), ensure_ascii=False)
+            payload = message.get("payload", {})
             return dlq_svc.enqueue_dead_letter(
                 source_queue=str(message.get("queue", "unknown")),
-                original_message=payload_str,
+                original_message=None,
+                original_payload=payload,
+                payload_type="structured",
+                raw_text=json.dumps(payload, ensure_ascii=False),
                 failure_reason=reason,
                 consumer_id=consumer_id,
             )
         except Exception as e:
             return {"ok": False, "reason": str(e)}
+
+    # ------------------------------------------------------------------
+    # 跨模块重放：从 dlq_handler 取得版本化载荷，按所用版本执行消费
+    # ------------------------------------------------------------------
+    def consume_replayed_dead_letter(
+        self,
+        dlq_id: int,
+        *,
+        deployment_version: str | None = None,
+        batch_id: str = "",
+    ) -> dict[str, Any]:
+        """消费一条待重放的死信载荷。
+
+        内容来源是 dlq_handler 的版本化死信载荷（可能与旧字符串副本同时
+        存在）。本方法按载荷声明的版本解释内容，并把消费结果写回死信复核
+        清单；同一个死信编号的并发重放只会确认一份实际结果。
+        """
+        from app.services.dlq_handler import DlqHandlerService
+        from app.services.dlq_payload import DEPLOYMENT_VERSION, PayloadVersionError
+
+        version = deployment_version or DEPLOYMENT_VERSION
+        dlq_svc = DlqHandlerService()
+        try:
+            view = dlq_svc.get_payload_for_replay(dlq_id, deployment_version=version)
+        except PayloadVersionError as exc:
+            return {
+                "ok": False,
+                "dlq_id": dlq_id,
+                "message": str(exc),
+                "payload_version": getattr(exc, "version", None),
+            }
+
+        if not view.get("ok"):
+            return {
+                "ok": False,
+                "dlq_id": dlq_id,
+                "message": view.get("message", "载荷不可用"),
+                "payload_version": view.get("payload_version"),
+            }
+
+        try:
+            outcome = self._consume_by_version(view, deployment_version=version)
+        except PayloadVersionError as exc:
+            return {
+                "ok": False,
+                "dlq_id": dlq_id,
+                "message": str(exc),
+                "payload_version": getattr(exc, "version", None),
+                "consumer_version": version,
+            }
+        if not outcome["ok"]:
+            return {
+                "ok": False,
+                "dlq_id": dlq_id,
+                "message": outcome["message"],
+                "payload_version": outcome.get("payload_version"),
+                "consumer_version": version,
+            }
+
+        actual_id = f"CONSUME-{view.get('记录编号') or dlq_id}-{uuid.uuid4().hex[:8].upper()}"
+        consumption = {
+            "ok": True,
+            "actual_consumption_id": actual_id,
+            "dlq_id": dlq_id,
+            "payload_version": outcome["payload_version"],
+            "payload_type": outcome["payload_type"],
+            "received_payload": outcome["received_payload"],
+            "source": view.get("source"),
+            "consumer_version": version,
+            "batch_id": batch_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._consumed_messages.append(consumption)
+        # 跨模块写回：消费结果直接落死信复核清单。
+        dlq_svc.record_review_entry(
+            dlq_id,
+            payload_view=view,
+            consumption=consumption,
+            batch_id=batch_id,
+            deployment_version=version,
+        )
+
+        return {
+            "ok": True,
+            "dlq_id": dlq_id,
+            "actual_consumption_id": actual_id,
+            "consumer_version": version,
+            "payload_version": outcome["payload_version"],
+            "payload_type": outcome["payload_type"],
+            "received_payload": outcome["received_payload"],
+            "raw_text": view.get("raw_text"),
+            "message": f"按载荷版本 {outcome['payload_version']} 完成消费",
+            "review": self._latest_review_for(dlq_id),
+            "payload_view": {
+                **view,
+                "payload_version": outcome["payload_version"],
+                "payload_type": outcome["payload_type"],
+            },
+        }
+
+    def _latest_review_for(self, dlq_id: int) -> dict[str, Any] | None:
+        from app.services.dlq_handler import DlqHandlerService
+
+        for row in reversed(DlqHandlerService().list_review_ledger(dlq_id)):
+            if row.get("result_status") == "已确认":
+                return row
+        return None
+
+    def _consume_by_version(
+        self,
+        view: dict[str, Any],
+        *,
+        deployment_version: str,
+    ) -> dict[str, Any]:
+        """按声明的载荷版本解释并执行消费；版本不明时不猜测。"""
+        from app.services.dlq_payload import (
+            SUPPORTED_PAYLOAD_VERSIONS,
+            PayloadVersionError,
+            interpret_for_consumption,
+        )
+
+        version = view.get("payload_version")
+        try:
+            version_number = int(version)
+        except (TypeError, ValueError):
+            raise PayloadVersionError(version, f"死信载荷版本无效：{version!r}")
+        if version_number not in SUPPORTED_PAYLOAD_VERSIONS:
+            raise PayloadVersionError(
+                version,
+                f"消费者不支持死信载荷版本 {version}（支持 {SUPPORTED_PAYLOAD_VERSIONS}）",
+            )
+
+        interpreted = interpret_for_consumption(view["payload"])
+        received = interpreted["received_payload"]
+        if interpreted["payload_type"] == "structured":
+            if not isinstance(received, (dict, list)):
+                return {
+                    "ok": False,
+                    "message": f"版本 {version_number} 声明为结构化载荷，但内容不是对象",
+                    "payload_version": version_number,
+                }
+            # 结构化消息按声明的版本解释；v2 起以 data 字段承载业务数据。
+            if version_number >= 2 and isinstance(received, dict):
+                business = received.get("data", received)
+            else:
+                business = received
+            return {
+                "ok": True,
+                "payload_version": version_number,
+                "payload_type": "structured",
+                "received_payload": business,
+                "message": f"结构化载荷已按版本 {version_number} 消费",
+            }
+
+        # 文本载荷：按原文逐字消费，形似 JSON 也不解析。
+        return {
+            "ok": True,
+            "payload_version": version_number,
+            "payload_type": "text",
+            "received_payload": received,
+            "message": f"文本载荷已按版本 {version_number} 原样消费",
+        }
 
     def _record_consumption(self, consumer_id: int, message: dict[str, Any], latency_ms: int) -> None:
         """记录消费成功的追踪信息。"""

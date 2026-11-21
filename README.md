@@ -69,6 +69,30 @@ npm run dev
 | 事件归档清理 | `event_archive` | 归档策略 | 策略编号、事件类型、归档条件 |
 | 集成监控看板 | `integration_monitor` | 监控指标 | 指标编号、监控对象、成功率 |
 
+## 死信载荷版本化
+
+死信记录升级后统一保存版本化载荷（`backend/app/services/dlq_payload.py`）：
+
+- 新入队的消息写入 `死信载荷` 对象，含 `payload_version`、`payload_type`、
+  `body`/`raw_text` 与摘要；`原始消息体` 继续保留原文，供旧消费者定位消息。
+- 普通文本逐字保留；形似 JSON 的旧文本仍按原文本重放。只有 `structured`
+  类型的载荷才按声明版本解释成对象。
+- 存量字符串载荷通过迁移补齐版本化副本，迁移可中断、可续做，不改变死信
+  编号与原始队列；回滚只移除迁移副本，原文和处置凭证（`dlq_receipt`）保留。
+- 重放由 `mq_consumer` 按载荷版本消费，结果写入死信复核清单
+  （`dlq_review_ledger`）；同一死信编号的并发重放只确认一份实际消费编号，
+  该编号写回处置凭证，换部署版本重新打开处置记录仍可关联。
+
+相关接口（`/api/pipeline`）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/dlq-payload/migrate` | 迁移/续做存量载荷（`interrupt_after` 可模拟中断） |
+| POST | `/dlq-payload/rollback` | 回滚迁移，保留原文与凭证 |
+| GET | `/dlq-payload/migration-status` | 查询迁移批次进度 |
+| GET | `/dlq-payload/{dlq_id}` | 核对消费入口实际取得的载荷、凭证与复核清单 |
+| POST | `/dlq-replay` | 重放死信（可带 `deployment_version`） |
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
